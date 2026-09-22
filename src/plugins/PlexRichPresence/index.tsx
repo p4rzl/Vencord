@@ -4,16 +4,28 @@
 
 import definePlugin, { OptionType } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
-import { Link } from "@components/Link";
 import { FluxDispatcher, Forms, Toasts, Button, ApplicationAssetUtils } from "@webpack/common";
+import { mountWidget, unmountWidget, updateWidget, WidgetState } from "./widget";
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let loginPollActive = false;
 let currentToken: string | null = null;
 let plexAccountUsername: string | null = null;
 let lastRatingKey: string | null = null;
+let currentPlayerMachineId: string | null = null;
+let lastKnownPlaying = false;
+let localShuffle = false;
+let localRepeat = false;
+let tickInFlight = false;
+let commandInFlight = false;
 
-const artAssetCache = new Map<string, string | null>();
+interface CachedArt {
+    assetId: string | undefined;
+    artUrl: string | null;
+    dataUrl: string | null;
+}
+
+const artAssetCache = new Map<string, CachedArt>();
 const ART_CACHE_LIMIT = 200;
 
 const FALLBACK_ART_URL = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/plex.png";
@@ -30,23 +42,64 @@ function toast(message: string, type: keyof typeof Toasts.Type = "MESSAGE") {
     });
 }
 
-function formatExternalAsset(url: string): string {
-    if (!url) return "";
-    if (url.startsWith("mp:external/")) return url;
-    const cleaned = url.replace(/^https?:\/\//, "https/");
-    return `mp:external/${cleaned}`;
+async function sendCommand(command: string, params?: Record<string, string>) {
+    if (commandInFlight || !currentToken || !currentPlayerMachineId || !settings.store.serverUrl) return;
+
+    commandInFlight = true;
+    try {
+        const result = await native()
+            .sendPlayerCommand(settings.store.serverUrl, currentToken, currentPlayerMachineId, command, params ?? {})
+            .catch((e: any) => ({ ok: false, error: String(e) }));
+
+        if (!result?.ok) {
+            console.error("[PlexRichPresence] Command failed:", command, result?.error);
+            toast(`Plex command failed: ${command}`, "FAILURE");
+            return;
+        }
+
+        // Plex updates its session asynchronously. Re-poll shortly after a
+        // command so the widget/RPC reflect the real player state.
+        setTimeout(() => void tick(), 500);
+    } finally {
+        commandInFlight = false;
+    }
+}
+
+const widgetCallbacks = {
+    onPlayPause: () => sendCommand(lastKnownPlaying ? "pause" : "play"),
+    onNext: () => sendCommand("skipNext"),
+    onPrevious: () => sendCommand("skipPrevious"),
+    onShuffleToggle: () => {
+        localShuffle = !localShuffle;
+        sendCommand("setParameters", { shuffle: localShuffle ? "1" : "0" });
+    },
+    onRepeatToggle: () => {
+        localRepeat = !localRepeat;
+        sendCommand("setParameters", { repeat: localRepeat ? "1" : "0" });
+    },
+    onSeek: (offsetMs: number) => sendCommand("seekTo", { offset: String(Math.round(offsetMs)) })
+};
+
+function formatExternalAsset(url: string): string | undefined {
+    if (!url) return undefined;
+    if (url.startsWith("mp:")) return url;
+    if (!/^https?:\/\//i.test(url)) return undefined;
+
+    // Discord's local activity layer expects media-proxy assets in mp: form.
+    // Discord converts the external URL to its media proxy internally.
+    return `mp:external/${url.replace(/^https?:\/\//i, "https/")}`;
 }
 
 async function registerAsset(applicationId: string, publicImageUrl: string): Promise<string | undefined> {
-    if (!publicImageUrl) return undefined;
+    if (!publicImageUrl || publicImageUrl.startsWith("data:")) return undefined;
 
-    try {
-        if (ApplicationAssetUtils?.fetchAssetIds && applicationId) {
+    if (ApplicationAssetUtils?.fetchAssetIds && applicationId) {
+        try {
             const [assetId] = await ApplicationAssetUtils.fetchAssetIds(applicationId, [publicImageUrl]);
             if (assetId) return assetId;
+        } catch (e) {
+            console.warn("[PlexRichPresence] Discord asset lookup failed, falling back to media proxy:", e);
         }
-    } catch (e) {
-        console.error("[PlexRichPresence] Discord fetchAssetIds failed:", e);
     }
 
     return formatExternalAsset(publicImageUrl);
@@ -129,19 +182,22 @@ const settings = definePluginSettings({
     },
     showAlbumArt: {
         type: OptionType.BOOLEAN,
-        description: "Show album cover in Rich Presence using MusicBrainz API",
+        description: "Show album cover in Rich Presence using iTunes/Deezer API",
                                       default: true
     },
     applicationId: {
         type: OptionType.STRING,
         description: "Discord Application ID (Optional)",
                                       default: ""
+    },
+    showControlWidget: {
+        type: OptionType.BOOLEAN,
+        description: "Show playback controls panel above user profile",
+                                      default: true
     }
 });
 
-async function resolveAlbumArtAsset(track: any): Promise<string | undefined> {
-    if (!settings.store.showAlbumArt) return undefined;
-
+async function resolveAlbumArt(track: any): Promise<CachedArt> {
     const appId = settings.store.applicationId?.trim() || "";
     const artist = track.grandparentTitle ?? track.originalTitle ?? "";
     const album = track.parentTitle ?? "";
@@ -151,8 +207,7 @@ async function resolveAlbumArtAsset(track: any): Promise<string | undefined> {
     const cacheKey = `${appId}:${artist}:${album}:${title}:${track.ratingKey || thumb}`;
 
     if (artAssetCache.has(cacheKey)) {
-        const cached = artAssetCache.get(cacheKey);
-        if (cached) return cached;
+        return artAssetCache.get(cacheKey)!;
     }
 
     let localPlexUrl: string | null = null;
@@ -161,26 +216,25 @@ async function resolveAlbumArtAsset(track: any): Promise<string | undefined> {
         localPlexUrl = `${baseUrl}${thumb}?X-Plex-Token=${encodeURIComponent(currentToken)}`;
     }
 
-    const publicUrl = await native().fetchOnlineCover(artist, album, title, localPlexUrl).catch(() => null);
+    const coverResult = await native().fetchOnlineCover(artist, album, title, localPlexUrl).catch(() => null);
+    const publicUrl = coverResult?.artUrl ?? null;
+    const dataUrl = coverResult?.dataUrl ?? null;
+
     const assetId = publicUrl ? await registerAsset(appId, publicUrl) : undefined;
+
+    let result: CachedArt = { assetId, artUrl: publicUrl, dataUrl };
+
+    if (!assetId && settings.store.showAlbumArt) {
+        const fallbackAssetId = await registerAsset(appId, FALLBACK_ART_URL);
+        result = { assetId: fallbackAssetId, artUrl: FALLBACK_ART_URL, dataUrl: FALLBACK_ART_URL };
+    }
 
     if (artAssetCache.size >= ART_CACHE_LIMIT) {
         artAssetCache.delete(artAssetCache.keys().next().value);
     }
 
-    if (assetId) {
-        artAssetCache.set(cacheKey, assetId);
-        return assetId;
-    }
-
-    const fallbackKey = `fallback:${appId}`;
-    if (artAssetCache.has(fallbackKey)) {
-        return artAssetCache.get(fallbackKey) ?? undefined;
-    }
-
-    const fallbackAssetId = await registerAsset(appId, FALLBACK_ART_URL);
-    artAssetCache.set(fallbackKey, fallbackAssetId ?? null);
-    return fallbackAssetId ?? undefined;
+    artAssetCache.set(cacheKey, result);
+    return result;
 }
 
 async function buildActivity(track: any) {
@@ -192,12 +246,12 @@ async function buildActivity(track: any) {
     const now = Date.now();
 
     const appId = settings.store.applicationId?.trim() || undefined;
-    const assetId = await resolveAlbumArtAsset(track);
+    const { assetId, artUrl, dataUrl } = await resolveAlbumArt(track);
 
     const activity: any = {
         name: "Plex",
         type: assetId ? 2 : 0,
-        application_id: appId,
+        ...(appId ? { application_id: appId } : {}),
         details: title,
         state: artist,
         flags: 1 << 0,
@@ -213,7 +267,7 @@ async function buildActivity(track: any) {
         };
     }
 
-    return activity;
+    return { activity, widgetArtUrl: dataUrl || artUrl };
 }
 
 function setActivity(activity: any) {
@@ -233,14 +287,25 @@ function clearActivity() {
 }
 
 async function tick() {
-    if (!currentToken || !settings.store.serverUrl) return;
+    if (tickInFlight || !currentToken || !settings.store.serverUrl) return;
 
-    const result = await native().fetchSessions(settings.store.serverUrl, currentToken).catch(e => {
-        console.error("[PlexRichPresence] fetchSessions failed:", e);
-        return null;
-    });
+    tickInFlight = true;
+    try {
+        const result = await native().fetchSessions(settings.store.serverUrl, currentToken).catch(e => {
+            console.error("[PlexRichPresence] fetchSessions failed:", e);
+            return null;
+        });
 
-    if (!result || result.unauthorized || !result.sessions) return;
+        if (!result || result.unauthorized || !result.sessions) {
+            if (result?.unauthorized) {
+                clearActivity();
+                lastRatingKey = null;
+                currentPlayerMachineId = null;
+                updateWidget(null);
+                toast("Plex session expired. Please log in again.", "FAILURE");
+            }
+            return;
+        }
 
     const usernameLower = plexAccountUsername?.toLowerCase();
     const mySession = result.sessions.find((s: any) => {
@@ -254,12 +319,38 @@ async function tick() {
             clearActivity();
             lastRatingKey = null;
         }
+        currentPlayerMachineId = null;
+        if (settings.store.showControlWidget) updateWidget(null);
         return;
     }
 
-    const activity = await buildActivity(mySession);
+    const { activity, widgetArtUrl } = await buildActivity(mySession);
     setActivity(activity);
     lastRatingKey = mySession.ratingKey;
+
+        currentPlayerMachineId = mySession.Player?.machineIdentifier ?? null;
+        lastKnownPlaying = mySession.Player?.state === "playing";
+        if (typeof mySession.Player?.shuffle === "boolean") localShuffle = mySession.Player.shuffle;
+        if (typeof mySession.Player?.repeat === "boolean") localRepeat = mySession.Player.repeat;
+
+    if (settings.store.showControlWidget) {
+        const widgetState: WidgetState = {
+            title: mySession.title ?? "Unknown track",
+            artist: mySession.grandparentTitle ?? mySession.originalTitle ?? "Unknown artist",
+            album: mySession.parentTitle ?? "",
+            artUrl: widgetArtUrl,
+            durationMs: mySession.duration ?? 0,
+            offsetMs: mySession.viewOffset ?? 0,
+            playing: lastKnownPlaying,
+            shuffle: localShuffle,
+            repeat: localRepeat,
+            timestamp: Date.now()
+        };
+            updateWidget(widgetState);
+        }
+    } finally {
+        tickInFlight = false;
+    }
 }
 
 export default definePlugin({
@@ -274,7 +365,7 @@ export default definePlugin({
         <Forms.FormText>
         1. Set 'Plex Media Server address' below (e.g. http://192.168.1.10:32400).{"\n"}
         2. Press 'Log in with Plex' and confirm in the browser tab.{"\n"}
-        3. Enable 'Show album art' to fetch covers directly from MusicBrainz.
+        3. Enable 'Show album art' to fetch covers directly from iTunes/Deezer.
         </Forms.FormText>
         </>
     ),
@@ -282,6 +373,7 @@ export default definePlugin({
     async start() {
         currentToken = settings.store.plexToken || null;
         artAssetCache.clear();
+        if (settings.store.showControlWidget) mountWidget(widgetCallbacks);
         if (currentToken) {
             plexAccountUsername = await native().fetchUsername(currentToken).catch(() => null);
         }
@@ -294,9 +386,15 @@ export default definePlugin({
         if (pollTimer) clearInterval(pollTimer);
         pollTimer = null;
         clearActivity();
+        unmountWidget();
         currentToken = null;
         plexAccountUsername = null;
         lastRatingKey = null;
+        currentPlayerMachineId = null;
+        tickInFlight = false;
+        commandInFlight = false;
+        localShuffle = false;
+        localRepeat = false;
         artAssetCache.clear();
     }
 });
