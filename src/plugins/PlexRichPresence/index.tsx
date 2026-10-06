@@ -1,15 +1,23 @@
+/*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 /**
  * PlexRichPresence — Vencord plugin
  */
 
-import definePlugin, { OptionType } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
-import { FluxDispatcher, Forms, Toasts, Button, ApplicationAssetUtils } from "@webpack/common";
+import definePlugin, { OptionType } from "@utils/types";
+import { ApplicationAssetUtils,Button, FluxDispatcher, Forms, Toasts } from "@webpack/common";
+
 import { mountWidget, unmountWidget, updateWidget, WidgetState } from "./widget";
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let loginPollActive = false;
 let currentToken: string | null = null;
+let plexAccountToken: string | null = null;
 let plexAccountUsername: string | null = null;
 let lastRatingKey: string | null = null;
 let currentPlayerMachineId: string | null = null;
@@ -34,11 +42,12 @@ function native() {
     return (window as any).VencordNative.pluginHelpers.PlexRichPresence;
 }
 
-function toast(message: string, type: keyof typeof Toasts.Type = "MESSAGE") {
-    Toasts.show({
-        id: Toasts.genId(),
-                type: Toasts.Type[type],
-                message
+function toast(message: string, type: "MESSAGE" | "SUCCESS" | "FAILURE" = "MESSAGE") {
+    const toastApi = Toasts as any;
+    toastApi.show({
+        id: toastApi.genId(),
+        type: toastApi.Type[type],
+        message
     });
 }
 
@@ -114,6 +123,135 @@ async function pollPin(id: number): Promise<string | null> {
     return null;
 }
 
+function resetStoredAuth() {
+    settings.store.plexToken = "";
+    settings.store.homeUserTitle = "";
+}
+
+function resetRuntimeAuth() {
+    currentToken = null;
+    plexAccountToken = null;
+    plexAccountUsername = null;
+}
+
+async function pickHomeUser() {
+    if (!plexAccountToken) {
+        toast("Log in with Plex first, then pick a Plex Home user.", "FAILURE");
+        return;
+    }
+
+    const users = await native().fetchHomeUsers(plexAccountToken).catch(() => []);
+    if (!users?.length) {
+        toast("No Plex Home profiles were found for this account.", "FAILURE");
+        return;
+    }
+
+    const optionsText = users.map((u: any, i: number) => {
+        const role = u?.restricted ? "managed" : "full";
+        const pin = u?.protected ? ", PIN protected" : "";
+        return `${i + 1}. ${u?.title ?? "Unknown"} (${role}${pin})`;
+    }).join("\n");
+
+    const response = window.prompt(
+        "Choose the Plex Home profile number for Rich Presence.\n" +
+        `Leave blank to use the account profile.\n\n${optionsText}`,
+        settings.store.homeUserTitle ? String(users.findIndex((u: any) => u?.title === settings.store.homeUserTitle) + 1) : ""
+    );
+
+    if (response === null) return;
+
+    const rawValue = response.trim();
+    if (!rawValue) {
+        settings.store.homeUserTitle = "";
+        toast("Using the main Plex account profile.", "SUCCESS");
+        await refreshAuthForServer();
+        void tick();
+        return;
+    }
+
+    const selectedIndex = Number(rawValue);
+    if (!Number.isInteger(selectedIndex) || selectedIndex < 1 || selectedIndex > users.length) {
+        toast("Invalid selection. Use one of the listed profile numbers.", "FAILURE");
+        return;
+    }
+
+    const selected = users[selectedIndex - 1];
+    settings.store.homeUserTitle = selected.title ?? "";
+    toast(`Selected Plex Home profile: ${selected.title}`, "SUCCESS");
+    await refreshAuthForServer();
+    void tick();
+}
+
+async function refreshAuthForServer(): Promise<boolean> {
+    if (!plexAccountToken || !settings.store.serverUrl) {
+        currentToken = null;
+        return false;
+    }
+
+    let effectiveToken = plexAccountToken;
+    let effectiveUsername = await native().fetchUsername(plexAccountToken).catch(() => null);
+
+    const selectedHomeUserTitle = settings.store.homeUserTitle?.trim();
+    if (selectedHomeUserTitle) {
+        const users = await native().fetchHomeUsers(plexAccountToken).catch(() => []);
+        const selectedUser = users.find((u: any) => u?.title?.toLowerCase() === selectedHomeUserTitle.toLowerCase());
+
+        if (!selectedUser) {
+            toast(`Plex Home profile "${selectedHomeUserTitle}" was not found. Pick another profile.`, "FAILURE");
+            currentToken = null;
+            return false;
+        }
+
+        let pin: string | undefined;
+        if (selectedUser.protected) {
+            const enteredPin = window.prompt(`Enter Plex Home PIN for "${selectedUser.title}"`, "");
+            if (enteredPin === null) {
+                toast("Plex Home switch canceled.", "MESSAGE");
+                currentToken = null;
+                return false;
+            }
+            pin = enteredPin.trim() || undefined;
+        }
+
+        const switched = await native().switchHomeUser(plexAccountToken, selectedUser.id, pin).catch(() => null);
+        if (!switched?.token) {
+            const reason = switched?.needsPin
+                ? "This Plex Home profile requires a valid PIN. Please try again."
+                : "Plex did not allow switching to this profile.";
+            toast(`${reason} Rich Presence cannot continue with this profile.`, "FAILURE");
+            currentToken = null;
+            return false;
+        }
+
+        effectiveToken = switched.token;
+        effectiveUsername = selectedUser.title ?? effectiveUsername;
+    }
+
+    const machineIdentifier = await native().fetchServerMachineIdentifier(settings.store.serverUrl, effectiveToken).catch(() => null);
+    if (machineIdentifier) {
+        const serverAccessToken = await native().resolveServerAccessToken(effectiveToken, machineIdentifier).catch(() => null);
+        if (serverAccessToken) {
+            effectiveToken = serverAccessToken;
+        } else if (selectedHomeUserTitle) {
+            toast(
+                "Plex did not provide a server-scoped token for this Plex Home profile. " +
+                "Ask the server owner to share access with this profile, then re-select it here.",
+                "FAILURE"
+            );
+            currentToken = null;
+            return false;
+        }
+    } else if (selectedHomeUserTitle) {
+        toast("Could not verify this Plex server for the selected Plex Home profile.", "FAILURE");
+        currentToken = null;
+        return false;
+    }
+
+    currentToken = effectiveToken;
+    plexAccountUsername = effectiveUsername;
+    return true;
+}
+
 async function startPlexLogin() {
     if (loginPollActive) {
         toast("Login already in progress, check your browser.", "MESSAGE");
@@ -127,9 +265,9 @@ async function startPlexLogin() {
     }
 
     const authUrl =
-    `https://app.plex.tv/auth#?clientID=vencord-plex-rich-presence` +
+    "https://app.plex.tv/auth#?clientID=vencord-plex-rich-presence" +
     `&code=${pin.code}` +
-    `&context%5Bdevice%5D%5Bproduct%5D=Vencord%20Plex%20Rich%20Presence`;
+    "&context%5Bdevice%5D%5Bproduct%5D=Vencord%20Plex%20Rich%20Presence";
 
     window.open(authUrl, "_blank");
 
@@ -148,27 +286,65 @@ async function startPlexLogin() {
     }
 
     settings.store.plexToken = token;
-    currentToken = token;
+    plexAccountToken = token;
+    currentToken = null;
     artAssetCache.clear();
-    plexAccountUsername = await native().fetchUsername(token).catch(() => null);
-    toast("Plex account linked successfully!", "SUCCESS");
+    const linked = await refreshAuthForServer();
+    toast(
+        linked
+            ? "Plex account linked successfully!"
+            : "Plex account linked. Select a valid Plex Home profile/server access to continue.",
+        linked ? "SUCCESS" : "MESSAGE"
+    );
     tick();
 }
 
 const settings = definePluginSettings({
     loginButton: {
         type: OptionType.COMPONENT,
-        description: "Link your Plex account (opens a browser tab, no password to type here)",
+        description: "Link your Plex account/home (opens browser, no password typed in Vencord)",
                                       component: () => (
                                           <Button onClick={() => startPlexLogin()}>
                                           Log in with Plex
                                           </Button>
                                       )
     },
+    logoutButton: {
+        type: OptionType.COMPONENT,
+        description: "Clear the Plex account token and selected Plex Home profile",
+                                      component: () => (
+                                         <Button
+                                             color={Button.Colors.RED}
+                                             onClick={() => {
+                                                 resetStoredAuth();
+                                                 resetRuntimeAuth();
+                                                 clearActivity();
+                                                 updateWidget(null);
+                                                 toast("Plex login cleared.", "SUCCESS");
+                                             }}
+                                         >
+                                             Log out from Plex
+                                         </Button>
+                                      )
+    },
+    homeUserButton: {
+        type: OptionType.COMPONENT,
+        description: "Pick which Plex Home profile this plugin should use",
+                                      component: () => (
+                                         <Button onClick={() => void pickHomeUser()}>
+                                             Choose Plex Home Profile
+                                         </Button>
+                                      )
+    },
     plexToken: {
         type: OptionType.STRING,
-        description: "Plex token (filled in automatically after 'Log in with Plex')",
+        description: "Plex account token (filled automatically; don't paste another user's token)",
                                       default: ""
+    },
+    homeUserTitle: {
+        type: OptionType.STRING,
+        description: "Optional Plex Home profile title (managed user). Leave empty to use your account profile.",
+        default: ""
     },
     serverUrl: {
         type: OptionType.STRING,
@@ -230,7 +406,8 @@ async function resolveAlbumArt(track: any): Promise<CachedArt> {
     }
 
     if (artAssetCache.size >= ART_CACHE_LIMIT) {
-        artAssetCache.delete(artAssetCache.keys().next().value);
+        const oldestKey = artAssetCache.keys().next().value as string | undefined;
+        if (oldestKey) artAssetCache.delete(oldestKey);
     }
 
     artAssetCache.set(cacheKey, result);
@@ -287,7 +464,12 @@ function clearActivity() {
 }
 
 async function tick() {
-    if (tickInFlight || !currentToken || !settings.store.serverUrl) return;
+    if (tickInFlight || !settings.store.serverUrl) return;
+    if (!currentToken && plexAccountToken) {
+        const refreshed = await refreshAuthForServer();
+        if (!refreshed) return;
+    }
+    if (!currentToken) return;
 
     tickInFlight = true;
     try {
@@ -302,7 +484,9 @@ async function tick() {
                 lastRatingKey = null;
                 currentPlayerMachineId = null;
                 updateWidget(null);
-                toast("Plex session expired. Please log in again.", "FAILURE");
+                resetStoredAuth();
+                resetRuntimeAuth();
+                toast("Plex authorization is no longer valid. Please log in again.", "FAILURE");
             }
             return;
         }
@@ -365,17 +549,20 @@ export default definePlugin({
         <Forms.FormText>
         1. Set 'Plex Media Server address' below (e.g. http://192.168.1.10:32400).{"\n"}
         2. Press 'Log in with Plex' and confirm in the browser tab.{"\n"}
-        3. Enable 'Show album art' to fetch covers directly from iTunes/Deezer.
+        3. If you use Plex Home, press 'Choose Plex Home Profile' and select your profile.{"\n"}
+        4. For PIN-protected managed profiles, this plugin asks for the PIN only when switching profiles and never stores it.{"\n"}
+        5. If Plex denies a managed profile switch or server access, use a Plex account/home flow that can switch profiles on plex.tv first.
         </Forms.FormText>
         </>
     ),
 
     async start() {
-        currentToken = settings.store.plexToken || null;
+        plexAccountToken = settings.store.plexToken || null;
+        currentToken = null;
         artAssetCache.clear();
         if (settings.store.showControlWidget) mountWidget(widgetCallbacks);
-        if (currentToken) {
-            plexAccountUsername = await native().fetchUsername(currentToken).catch(() => null);
+        if (plexAccountToken) {
+            await refreshAuthForServer();
         }
         await tick();
         const intervalSeconds = Math.max(5, settings.store.pollInterval || 15);
@@ -387,8 +574,7 @@ export default definePlugin({
         pollTimer = null;
         clearActivity();
         unmountWidget();
-        currentToken = null;
-        plexAccountUsername = null;
+        resetRuntimeAuth();
         lastRatingKey = null;
         currentPlayerMachineId = null;
         tickInFlight = false;
