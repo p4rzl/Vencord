@@ -13,6 +13,7 @@ export interface WidgetState {
     shuffle: boolean;
     repeat: boolean;
     timestamp: number;
+    controlsEnabled: boolean;
 }
 
 export interface WidgetCallbacks {
@@ -385,6 +386,23 @@ function renderProgress() {
     bar.setAttribute("aria-valuenow", String(Math.round(elapsedMs)));
 }
 
+function setControlsEnabled(enabled: boolean) {
+    if (!container) return;
+
+    const controls = container.querySelectorAll(".prp-btn") as NodeListOf<HTMLButtonElement>;
+    for (const btn of controls) {
+        btn.disabled = !enabled;
+        btn.style.opacity = enabled ? "1" : ".45";
+        btn.style.cursor = enabled ? "pointer" : "not-allowed";
+    }
+
+    const bar = container.querySelector(".prp-bar") as HTMLDivElement | null;
+    if (bar) {
+        bar.style.pointerEvents = enabled ? "auto" : "none";
+        bar.style.opacity = enabled ? "1" : ".5";
+    }
+}
+
 export function updateWidget(state: WidgetState | null) {
     if (!container) return;
 
@@ -446,6 +464,7 @@ export function updateWidget(state: WidgetState | null) {
 
     (container.querySelector(".prp-duration") as HTMLElement).textContent = fmt(state.durationMs);
     renderProgress();
+    setControlsEnabled(state.controlsEnabled);
 
     const playBtn = container.querySelector(".prp-playpause") as HTMLButtonElement;
     playBtn.innerHTML = state.playing ? icon("pause") : icon("play");

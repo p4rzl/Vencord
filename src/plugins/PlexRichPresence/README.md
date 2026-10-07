@@ -1,23 +1,57 @@
 # PlexRichPresence
 
-A Vencord plugin that displays your active **Plex Media Server** or **Plexamp** music playback directly in your Discord status, styled like Spotify (*"Listening to Plex"*).
+A Vencord plugin that shows your active **Plex** music playback in Discord status (Spotify-style), with optional playback controls.
 
-## Features
+## What changed
 
-- **Secure Login (Plex OAuth)**: Authenticates via Plex PIN OAuth without storing your password.
-- **Plex Home support**: Works with standard Plex accounts and Plex Home profiles (including managed users) through Plex Home user switching.
-- **Automatic Album Art**: Fetches cover art automatically via the **MusicBrainz API** (Cover Art Archive) and **iTunes Search API**, with local server fallback and a generic Plex icon as a backup.
-- **Spotify Style**: Displays track title, artist, album, cover art, and real-time playback progress.
+This plugin now uses Plex account/resource discovery instead of requiring a manually typed server URL.
+
+- Uses official Plex PIN login in browser (`Log in with Plex`)
+- Never asks for your Plex password
+- Discovers accessible Plex servers/resources from Plex account APIs
+- Lets you choose the resource when multiple servers are available
+- Supports Plex Home profile selection (including managed users)
+- Keeps session identity tied to the selected/current Plex user (not silently server owner)
 
 ## Setup
 
-1. Set `Plex Media Server address` (for example `http://192.168.1.10:32400`).
-2. Click `Log in with Plex` and complete the browser flow.
-3. If you use Plex Home, click `Choose Plex Home Profile` and select the correct profile.
-4. For PIN-protected managed profiles, enter the Plex Home PIN when prompted (the PIN is not stored).
+1. Open plugin settings and click **Log in with Plex**.
+2. Complete Plex auth in browser (or use `plex.tv/link` with the shown code).
+3. Optional: click **Choose Plex Home Profile** and select your managed/shared profile.
+4. Click **Choose Plex Server Resource** if multiple resources are available.
 
-## Plex Home notes and limitations
+The resource list includes useful labels:
 
-- This plugin does **not** accept pasted owner/server tokens as a workaround.
-- After a Plex Home switch, the plugin resolves a server-scoped token from Plex resources for the selected profile.
-- If Plex does not provide server access for that selected profile, playback polling cannot continue until that profile is shared on the server (or another profile is selected).
+- Server/resource name
+- Owner (`You` or shared owner)
+- Connection type (`Local direct`, `Remote direct`, or `Relay`)
+- Selected URI
+
+The plugin prefers a valid local/direct connection automatically, but remote/shared resources are supported.
+
+## Plex Home behavior
+
+- Managed users may require a Plex Home PIN when switching profile.
+- PIN is prompted only during switch and is never stored.
+- If Plex denies switch/token exchange, plugin shows an explicit error and does not impersonate the owner profile.
+
+## Permissions and limitations
+
+- Rich Presence requires read access to `/status/sessions` on the selected resource.
+- Playback controls are automatically disabled when control permission is not available.
+- Rich Presence can still work when controls are disabled.
+
+## Troubleshooting
+
+- **No resources found**: ask server owner to share the server with your Plex account/profile.
+- **`/status/sessions` denied**: choose another resource or request session access from owner.
+- **Auth expired/unauthorized**: log out and log in again.
+- **Resource changed/removed**: re-open settings and select a resource again.
+
+## Legacy migration
+
+Older `serverUrl` / `plexToken` settings are handled for compatibility:
+
+- existing Plex token is reused as account login when possible
+- legacy server URL is used only to migrate to a discovered resource
+- manual server URL setup is deprecated for normal usage
