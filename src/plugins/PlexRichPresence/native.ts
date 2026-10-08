@@ -10,13 +10,42 @@
 
 const CLIENT_IDENTIFIER = "vencord-plex-rich-presence";
 const PRODUCT_NAME = "Vencord Plex Rich Presence";
+const PRODUCT_VERSION = "1.0";
 const PLEX_RESOURCES_URL = "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1&includeIPv6=1";
 
 interface PlexHomeUser {
     id: string;
     title: string;
+    username?: string;
     restricted: boolean;
     protected: boolean;
+}
+
+interface PlexCurrentUser {
+    id: string | null;
+    title: string | null;
+    username: string | null;
+    email: string | null;
+    home: boolean;
+}
+
+interface PlexResourceConnection {
+    address: string | null;
+    local: boolean;
+    protocol: string | null;
+    relay: boolean;
+    uri: string | null;
+}
+
+interface PlexResource {
+    accessToken: string | null;
+    clientIdentifier: string;
+    name: string;
+    owned: boolean;
+    ownerTitle: string | null;
+    provides: string[];
+    selectedConnection: PlexResourceConnection | null;
+    supportsPlayerCommands: boolean;
 }
 
 function plexHeaders(token?: string, extra: Record<string, string> = {}) {
@@ -24,6 +53,7 @@ function plexHeaders(token?: string, extra: Record<string, string> = {}) {
         Accept: "application/json",
         "X-Plex-Client-Identifier": CLIENT_IDENTIFIER,
         "X-Plex-Product": PRODUCT_NAME,
+        "X-Plex-Version": PRODUCT_VERSION,
         "X-Plex-Device": "Vencord",
         "X-Plex-Device-Name": PRODUCT_NAME,
         "X-Plex-Platform": process.platform,
@@ -51,6 +81,7 @@ function parseHomeUsersXml(xml: string): PlexHomeUser[] {
         users.push({
             id,
             title,
+            username: attrs.username || undefined,
             restricted: attrs.restricted === "1" || attrs.restricted === "true",
             protected: attrs.protected === "1" || attrs.protected === "true"
         });
@@ -68,14 +99,135 @@ function parseSwitchTokenXml(xml: string): string | null {
     return match?.[1] ?? null;
 }
 
-function parseResourceAccessTokenXml(xml: string, machineIdentifier: string): string | null {
-    for (const match of xml.matchAll(/<Device\b[^>]*>/g)) {
+function parseCurrentUserXml(xml: string): PlexCurrentUser | null {
+    const match = xml.match(/<user\b[^>]*>/i);
+    if (!match) return null;
+
+    const attrs = parseXmlAttributes(match[0]);
+    return {
+        id: attrs.id ?? null,
+        title: attrs.title ?? attrs.username ?? null,
+        username: attrs.username ?? null,
+        email: attrs.email ?? null,
+        home: attrs.home === "1" || attrs.home === "true"
+    };
+}
+
+function parseResourceConnectionsXml(deviceXml: string): PlexResourceConnection[] {
+    const connections: PlexResourceConnection[] = [];
+
+    for (const match of deviceXml.matchAll(/<Connection\b[^>]*\/?>(?:<\/Connection>)?/g)) {
         const attrs = parseXmlAttributes(match[0]);
-        if (attrs.clientIdentifier === machineIdentifier && attrs.accessToken) {
-            return attrs.accessToken;
-        }
+        connections.push({
+            address: attrs.address ?? null,
+            local: attrs.local === "1" || attrs.local === "true",
+            protocol: attrs.protocol ?? null,
+            relay: attrs.relay === "1" || attrs.relay === "true",
+            uri: attrs.uri ?? null,
+        });
     }
-    return null;
+
+    return connections.filter(c => Boolean(c.uri));
+}
+
+function normalizeProvides(value: any): string[] {
+    if (Array.isArray(value)) {
+        return value.map(v => String(v).trim().toLowerCase()).filter(Boolean);
+    }
+
+    if (typeof value === "string") {
+        return value.split(",").map(v => v.trim().toLowerCase()).filter(Boolean);
+    }
+
+    return [];
+}
+
+function connectionScore(connection: PlexResourceConnection): number {
+    let score = 0;
+    if (connection.local) score += 300;
+    if (!connection.relay) score += 120;
+    if (connection.protocol?.toLowerCase() === "https") score += 50;
+    if (connection.protocol?.toLowerCase() === "http") score += 30;
+    if (connection.address) score += 5;
+    return score;
+}
+
+function pickBestConnection(connections: PlexResourceConnection[]): PlexResourceConnection | null {
+    if (!connections.length) return null;
+
+    return [...connections]
+        .sort((a, b) => connectionScore(b) - connectionScore(a))
+        .find(c => Boolean(c.uri)) ?? null;
+}
+
+function normalizeResourceFromJson(resource: any): PlexResource | null {
+    const clientIdentifier = String(resource?.clientIdentifier ?? "").trim();
+    if (!clientIdentifier) return null;
+
+    const provides = normalizeProvides(resource?.provides);
+    if (!provides.includes("server")) return null;
+
+    const connectionsRaw = Array.isArray(resource?.connections) ? resource.connections : [];
+    const connections: PlexResourceConnection[] = connectionsRaw
+        .map((conn: any) => ({
+            address: conn?.address ? String(conn.address) : null,
+            local: Boolean(conn?.local),
+            protocol: conn?.protocol ? String(conn.protocol) : null,
+            relay: Boolean(conn?.relay),
+            uri: conn?.uri ? String(conn.uri) : null
+        }))
+        .filter(conn => Boolean(conn.uri));
+
+    const selectedConnection = pickBestConnection(connections);
+
+    return {
+        accessToken: resource?.accessToken ? String(resource.accessToken) : null,
+        clientIdentifier,
+        name: String(resource?.name ?? resource?.product ?? "Unknown server"),
+        owned: Boolean(resource?.owned),
+        ownerTitle: resource?.sourceTitle ? String(resource.sourceTitle) : null,
+        provides,
+        selectedConnection,
+        supportsPlayerCommands: provides.includes("server")
+    };
+}
+
+function parseResourcesXml(xml: string): PlexResource[] {
+    const resources: PlexResource[] = [];
+
+    for (const match of xml.matchAll(/<Device\b[^>]*>[\s\S]*?<\/Device>/g)) {
+        const rawDevice = match[0];
+        const openTag = rawDevice.match(/<Device\b[^>]*>/)?.[0];
+        if (!openTag) continue;
+
+        const attrs = parseXmlAttributes(openTag);
+        const provides = normalizeProvides(attrs.provides);
+        if (!attrs.clientIdentifier || !provides.includes("server")) continue;
+
+        const connections = parseResourceConnectionsXml(rawDevice);
+        const selectedConnection = pickBestConnection(connections);
+
+        resources.push({
+            accessToken: attrs.accessToken ?? null,
+            clientIdentifier: attrs.clientIdentifier,
+            name: attrs.name || attrs.product || "Unknown server",
+            owned: attrs.owned === "1" || attrs.owned === "true",
+            ownerTitle: attrs.sourceTitle ?? null,
+            provides,
+            selectedConnection,
+            supportsPlayerCommands: provides.includes("server")
+        });
+    }
+
+    return resources;
+}
+
+function buildServerUrl(serverUrl: string, path: string, params?: URLSearchParams): string {
+    const base = serverUrl.replace(/\/$/, "");
+    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    const url = `${base}${normalizedPath}`;
+    if (!params || !params.size) return url;
+    return `${url}?${params.toString()}`;
 }
 
 /**
@@ -84,12 +236,12 @@ function parseResourceAccessTokenXml(xml: string, machineIdentifier: string): st
 function cleanText(str: string): string {
     if (!str) return "";
     return str
-    .replace(/\[.*?\]/g, "")
-    .replace(/\(.*?\)/g, "")
-    .replace(/#\w+/g, "")
-    .replace(/\bfeat\..*$/gi, "")
-    .replace(/\bft\..*$/gi, "")
-    .trim();
+        .replace(/\[.*?\]/g, "")
+        .replace(/\(.*?\)/g, "")
+        .replace(/#\w+/g, "")
+        .replace(/\bfeat\..*$/gi, "")
+        .replace(/\bft\..*$/gi, "")
+        .trim();
 }
 
 export async function requestPin(_: any) {
@@ -110,7 +262,7 @@ export async function requestPin(_: any) {
 
 export async function checkPin(_: any, id: number) {
     try {
-        const res = await fetch(`https://plex.tv/api/v2/pins/${id}`, {
+        const res = await fetch(`https://plex.tv/api/v2/pins/${encodeURIComponent(String(id))}`, {
             headers: plexHeaders()
         });
         if (!res.ok) return null;
@@ -122,14 +274,27 @@ export async function checkPin(_: any, id: number) {
     }
 }
 
-export async function fetchUsername(_: any, token: string) {
+export async function fetchCurrentUser(_: any, token: string): Promise<PlexCurrentUser | null> {
     try {
         const res = await fetch("https://plex.tv/api/v2/user", {
-            headers: plexHeaders(token)
+            headers: plexHeaders(token, { Accept: "application/json, application/xml;q=0.9, text/xml;q=0.8" })
         });
+
         if (!res.ok) return null;
-        const data: any = await res.json();
-        return data?.username ?? data?.title ?? null;
+
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+            const data: any = await res.json();
+            return {
+                id: data?.id != null ? String(data.id) : null,
+                title: data?.title ? String(data.title) : data?.username ? String(data.username) : null,
+                username: data?.username ? String(data.username) : null,
+                email: data?.email ? String(data.email) : null,
+                home: Boolean(data?.home)
+            };
+        }
+
+        return parseCurrentUserXml(await res.text());
     } catch {
         return null;
     }
@@ -150,6 +315,7 @@ export async function fetchHomeUsers(_: any, token: string) {
                 .map((u: any) => ({
                     id: String(u?.id ?? ""),
                     title: String(u?.title ?? u?.username ?? u?.email ?? ""),
+                    username: u?.username ? String(u.username) : undefined,
                     restricted: Boolean(u?.restricted),
                     protected: Boolean(u?.protected)
                 }))
@@ -167,7 +333,7 @@ export async function switchHomeUser(_: any, token: string, userId: string, pin?
     try {
         const params = new URLSearchParams();
         if (pin) params.set("pin", pin);
-        const url = `https://plex.tv/api/home/users/${encodeURIComponent(userId)}/switch${params.size ? `?${params}` : ""}`;
+        const url = `https://plex.tv/api/home/users/${encodeURIComponent(userId)}/switch${params.size ? `?${params.toString()}` : ""}`;
         const res = await fetch(url, {
             method: "POST",
             headers: plexHeaders(token, { Accept: "application/json, application/xml;q=0.9, text/xml;q=0.8" })
@@ -196,9 +362,33 @@ export async function switchHomeUser(_: any, token: string, userId: string, pin?
     }
 }
 
+export async function fetchResources(_: any, token: string): Promise<PlexResource[]> {
+    try {
+        const res = await fetch(PLEX_RESOURCES_URL, {
+            headers: plexHeaders(token, { Accept: "application/json, application/xml;q=0.9, text/xml;q=0.8" })
+        });
+
+        if (!res.ok) return [];
+
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+            const data: any = await res.json();
+            const resources = Array.isArray(data) ? data : Array.isArray(data?.resources) ? data.resources : [];
+            return resources
+                .map(normalizeResourceFromJson)
+                .filter((resource: PlexResource | null): resource is PlexResource => Boolean(resource && resource.selectedConnection?.uri));
+        }
+
+        return parseResourcesXml(await res.text()).filter(resource => Boolean(resource.selectedConnection?.uri));
+    } catch (e) {
+        console.error("[PlexRichPresence:native] Failed to fetch Plex resources:", e);
+        return [];
+    }
+}
+
 export async function fetchServerMachineIdentifier(_: any, serverUrl: string, token: string) {
     try {
-        const url = `${serverUrl.replace(/\/$/, "")}/identity`;
+        const url = buildServerUrl(serverUrl, "/identity");
         const res = await fetch(url, {
             headers: plexHeaders(token, { Accept: "application/json, application/xml;q=0.9, text/xml;q=0.8" })
         });
@@ -211,30 +401,7 @@ export async function fetchServerMachineIdentifier(_: any, serverUrl: string, to
         }
 
         return parseMachineIdentifierFromXml(await res.text());
-    } catch (e) {
-        console.warn("[PlexRichPresence:native] Failed to fetch server identity:", e);
-        return null;
-    }
-}
-
-export async function resolveServerAccessToken(_: any, token: string, machineIdentifier: string) {
-    try {
-        const res = await fetch(PLEX_RESOURCES_URL, {
-            headers: plexHeaders(token, { Accept: "application/json, application/xml;q=0.9, text/xml;q=0.8" })
-        });
-        if (!res.ok) return null;
-
-        const contentType = res.headers.get("content-type") || "";
-        if (contentType.includes("application/json")) {
-            const data: any = await res.json();
-            const resources = Array.isArray(data) ? data : Array.isArray(data?.resources) ? data.resources : [];
-            const match = resources.find((r: any) => r?.clientIdentifier === machineIdentifier);
-            return match?.accessToken ?? null;
-        }
-
-        return parseResourceAccessTokenXml(await res.text(), machineIdentifier);
-    } catch (e) {
-        console.warn("[PlexRichPresence:native] Failed to resolve server-scoped token:", e);
+    } catch {
         return null;
     }
 }
@@ -258,37 +425,56 @@ export async function sendPlayerCommand(
         const qs = new URLSearchParams({
             type: "music",
             commandID: String(nextCommandId(machineIdentifier)),
-                                       ...params
-        }).toString();
-        const url = `${serverUrl.replace(/\/$/, "")}/player/playback/${command}?${qs}`;
+            ...params
+        });
+        const url = buildServerUrl(serverUrl, `/player/playback/${encodeURIComponent(command)}`, qs);
         const res = await fetch(url, {
             headers: plexHeaders(token, {
                 "X-Plex-Target-Client-Identifier": machineIdentifier,
             })
         });
-        if (!res.ok) return { ok: false, error: `Server responded with status ${res.status}` };
-        return { ok: true, error: null };
+        if (!res.ok) {
+            return {
+                ok: false,
+                unauthorized: res.status === 401 || res.status === 403,
+                error: `Server responded with status ${res.status}`
+            };
+        }
+        return { ok: true, unauthorized: false, error: null };
     } catch (e: any) {
         const message = e?.cause?.message || e?.message || String(e);
         console.error("[PlexRichPresence:native] Player command failed:", command, e);
-        return { ok: false, error: message };
+        return { ok: false, unauthorized: false, error: message };
     }
 }
 
 export async function fetchSessions(_: any, serverUrl: string, token: string) {
     try {
-        const url = `${serverUrl.replace(/\/$/, "")}/status/sessions`;
-        const res = await fetch(url, { headers: plexHeaders(token) });
-        if (res.status === 401) return { unauthorized: true, sessions: null, error: null };
-        if (!res.ok) {
-            return { unauthorized: false, sessions: null, error: `Server responded with status ${res.status}` };
+        const url = buildServerUrl(serverUrl, "/status/sessions");
+        const res = await fetch(url, {
+            headers: plexHeaders(token, { Accept: "application/json" })
+        });
+
+        if (res.status === 401 || res.status === 403) {
+            return { unauthorized: true, status: res.status, sessions: null, error: null };
         }
+
+        if (!res.ok) {
+            return {
+                unauthorized: false,
+                status: res.status,
+                sessions: null,
+                error: `Server responded with status ${res.status}`
+            };
+        }
+
         const data: any = await res.json();
-        return { unauthorized: false, sessions: data?.MediaContainer?.Metadata ?? [], error: null };
+        const sessions = Array.isArray(data?.MediaContainer?.Metadata) ? data.MediaContainer.Metadata : [];
+        return { unauthorized: false, status: res.status, sessions, error: null };
     } catch (e: any) {
         const message = e?.cause?.message || e?.message || String(e);
         console.error("[PlexRichPresence:native] Error contacting the Plex Media Server:", e);
-        return { unauthorized: false, sessions: null, error: message };
+        return { unauthorized: false, status: 0, sessions: null, error: message };
     }
 }
 
