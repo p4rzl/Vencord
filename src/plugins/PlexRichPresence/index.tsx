@@ -10,6 +10,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ApplicationAssetUtils, Button, FluxDispatcher, Forms, showToast } from "@webpack/common";
 
 import { isPublicCoverUrl } from "./artwork";
+import { cancelPlexDialogs, choosePlexOption, requestPlexPin, showPlexDiagnostics } from "./dialogs";
 import { activityData, PlaybackLifetime, supportsCommand } from "./playback";
 import { CLIENT_IDENTIFIER, safeBaseUrl, serverUrl } from "./plex";
 import type { FailureKind, Playback, PlayerCommand, PlexCurrentUser, PlexResource } from "./types";
@@ -66,6 +67,7 @@ function failure(kind: FailureKind, stage: string, status: number) {
 
 function invalidateContext() {
     lifetime.invalidate();
+    cancelPlexDialogs();
     effectiveToken = null;
     effectiveUser = null;
     resources = [];
@@ -77,7 +79,7 @@ function invalidateContext() {
 }
 
 async function runAction(action: () => Promise<void>) {
-    if (setupActive) return;
+    if (setupActive) { showToast("Finish or cancel the current Plex setup dialog first."); return; }
     setupActive = true;
     try { await action(); } catch {
         notice("setup-error", "Plex setup failed. Try again; no credentials were logged.");
@@ -315,11 +317,12 @@ async function chooseHomeUser() {
     const result = await Native.fetchHomeUsers(settings.store.plexToken);
     if (!lifetime.current(generation)) return;
     if (!result.ok) { failure(result.kind, "home", result.status); return; }
-    const answer = window.prompt(`Choose Plex Home profile (0 = main account):\n${result.value.map((u, i) => `${i + 1}. ${u.title}${u.protected ? " (PIN)" : ""}`).join("\n")}`, "0");
-    if (answer === null || !answer.trim()) return;
-    const index = Number(answer);
-    if (!Number.isInteger(index) || index < 0 || index > result.value.length) return;
-    if (!index) {
+    const selectedId = await choosePlexOption("Choose Plex Home Profile", [
+        { label: "Main Plex account", value: "" },
+        ...result.value.map(u => ({ label: `${u.title}${u.protected ? " (PIN)" : ""}`, value: u.id }))
+    ], settings.store.homeUserId);
+    if (selectedId === null || !lifetime.current(generation)) return;
+    if (!selectedId) {
         settings.store.homeUserId = "";
         settings.store.homeUserTitle = "";
         needsProfileSelection = false;
@@ -327,9 +330,10 @@ async function chooseHomeUser() {
         await tick();
         return;
     }
-    const selected = result.value[index - 1];
-    const pin = selected.protected ? window.prompt(`Plex Home PIN for ${selected.title}`, "") : undefined;
-    if (pin === null) return;
+    const selected = result.value.find(u => u.id === selectedId);
+    if (!selected) return;
+    const pin = selected.protected ? await requestPlexPin(selected.title) : undefined;
+    if (pin === null || !lifetime.current(generation)) return;
     const switched = await Native.switchHomeUser(settings.store.plexToken, selected.id, pin?.trim());
     if (!lifetime.current(generation)) return;
     if (!switched.ok) { failure(switched.kind, "home-switch", switched.status); return; }
@@ -351,16 +355,19 @@ async function chooseResource(player = false) {
     if (!await ensureContext(generation) || !lifetime.current(generation)) return;
     const choices = resources.filter(r => player ? r.owned && r.provides.includes("player") : r.provides.includes("server"));
     if (!choices.length && !player) { notice("no-resources", "No shared or owned Plex servers were found."); return; }
-    const response = window.prompt(`Choose ${player ? "player (0 = automatic)" : "server"}:\n${choices.map((r, i) => `${i + 1}. ${r.name}${!r.owned ? " (shared)" : ""}`).join("\n")}`, player ? "0" : "1");
-    if (response === null || !response.trim()) return;
-    const index = Number(response);
-    if (!Number.isInteger(index) || index < (player ? 0 : 1) || index > choices.length) return;
+    const selectedId = await choosePlexOption(player ? "Choose Plex Player" : "Choose Plex Server Resource", [
+        ...(player ? [{ label: "Automatic detection", value: "" }] : []),
+        ...choices.map(r => ({ label: `${r.name}${!r.owned ? ` (shared${r.ownerTitle ? ` by ${r.ownerTitle}` : ""})` : ""}`, value: r.clientIdentifier }))
+    ], player ? settings.store.preferredPlayerId : settings.store.selectedResourceId);
+    if (selectedId === null || !lifetime.current(generation)) return;
+    const selected = choices.find(r => r.clientIdentifier === selectedId);
+    if (!selected && (!player || selectedId)) return;
     lifetime.invalidate();
     clearPlayback();
-    if (player) settings.store.preferredPlayerId = index ? choices[index - 1].clientIdentifier : "";
+    if (player) settings.store.preferredPlayerId = selectedId;
     else {
-        settings.store.selectedResourceId = choices[index - 1].clientIdentifier;
-        settings.store.selectedResourceName = choices[index - 1].name;
+        settings.store.selectedResourceId = selected!.clientIdentifier;
+        settings.store.selectedResourceName = selected!.name;
         settings.store.selectedResourceUri = "";
     }
     await Native.resetContext();
@@ -407,7 +414,7 @@ const settings = definePluginSettings({
     resourceButton: { type: OptionType.COMPONENT, description: "Select an owned or shared server", component: () => <Button onClick={() => void runAction(() => chooseResource())}>Choose Plex Server Resource</Button> },
     playerButton: { type: OptionType.COMPONENT, description: "Select a preferred player for session/timeline detection", component: () => <Button onClick={() => void runAction(() => chooseResource(true))}>Choose Plex Player</Button> },
     companionUrl: { type: OptionType.STRING, description: "Optional Plexamp Companion endpoint (blank disables probing). Its ID must match a player owned by this profile; use a trusted endpoint only", default: "http://127.0.0.1:32500", onChange: () => { lifetime.invalidate(); clearPlayback(); } },
-    diagnosticsButton: { type: OptionType.COMPONENT, description: "Show safe diagnostics (no credentials, addresses or track titles)", component: () => <Button onClick={() => window.alert(JSON.stringify(diagnostics, null, 2))}>Show diagnostics</Button> },
+    diagnosticsButton: { type: OptionType.COMPONENT, description: "Show safe diagnostics (no credentials, addresses or track titles)", component: () => <Button onClick={() => showPlexDiagnostics(diagnostics)}>Show diagnostics</Button> },
     plexToken: { type: OptionType.STRING, description: "Plex account token", default: "", hidden: true },
     homeUserId: { type: OptionType.STRING, description: "Plex Home profile ID", default: "", hidden: true },
     homeUserTitle: { type: OptionType.STRING, description: "Plex Home profile name", default: "", hidden: true },

@@ -2,9 +2,11 @@
     margin: 6px 8px;
     padding: 10px;
     border-radius: 8px;
-    background: var(--background-secondary);
-    color: var(--text-normal);
-    font-size: 12px;
+    background: var(--background-base-low, var(--background-secondary, #2b2d31));
+    color: var(--text-default, var(--text-normal, #dbdee1));
+    font: 13px/1.3 var(--font-primary, sans-serif);
+    min-width: 0;
+    box-sizing: border-box;
 }
 
 .prp-row {
@@ -24,7 +26,8 @@
 .prp-placeholder {
     display: grid;
     place-items: center;
-    background: var(--background-tertiary);
+    background: var(--background-base-lower, var(--background-tertiary, #1e1f22));
+    color: var(--text-default, var(--text-normal, #dbdee1));
     font-size: 24px;
 }
 
@@ -33,25 +36,34 @@
     flex-direction: column;
     gap: 2px;
     min-width: 0;
+    flex: 1;
+    overflow: hidden;
 }
 
 .prp-meta > * {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: var(--text-default, var(--text-normal, #dbdee1));
+}
+
+.prp-meta > strong {
+    color: var(--text-strong, var(--header-primary, #f2f3f5));
+    font-size: 14px;
+    font-weight: 600;
 }
 
 .prp-source,
 .prp-times,
 .prp-meta small {
-    color: var(--text-muted);
-    font-size: 10px;
+    color: var(--text-muted, var(--text-default, #b5bac1));
+    font-size: 12px;
 }
 
 .prp-seek {
     width: 100%;
     margin: 8px 0 0;
-    accent-color: var(--brand-500);
+    accent-color: var(--brand-500, #5865f2);
 }
 
 .prp-times,
@@ -72,16 +84,19 @@
     width: 30px;
     height: 30px;
     background: transparent;
-    color: var(--interactive-normal);
+    color: var(--interactive-icon-default, var(--interactive-normal, #dbdee1));
+    font: inherit;
+    line-height: 1;
     cursor: pointer;
 }
 
 .prp-button:hover {
-    background: var(--background-modifier-hover);
+    background: var(--background-mod-strong, var(--background-modifier-hover, rgb(255 255 255 / 10%)));
+    color: var(--interactive-icon-hover, var(--text-strong, #f2f3f5));
 }
 
 .prp-button:focus-visible {
-    outline: 2px solid var(--brand-500);
+    outline: 2px solid var(--brand-500, #5865f2);
 }
 
 .prp-button:disabled {
@@ -90,5 +105,12 @@
 }
 
 .prp-active {
-    color: var(--brand-500);
+    color: var(--brand-500, #5865f2);
+}
+
+.prp-diagnostics {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+    color: var(--text-default, var(--text-normal, #dbdee1));
 }

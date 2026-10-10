@@ -11,6 +11,8 @@ Requires desktop Vencord and permission to read the shared/owned music library.
 4. Optionally **Choose Plex Player** to follow a specific device. Automatic mode prefers a playing session belonging to your selected identity.
 5. Enable activity sharing in Discord's Activity Privacy settings. Restart Discord after installing this version so the account-panel patch can load.
 
+Profile, server and player selection use Discord modals, not unsupported Electron `window.prompt()` dialogs. Cancel/escape leaves the current choice unchanged. Plex Home PINs are entered in a masked field and are never saved. The controller supports current and legacy Discord theme variables for readable dark/light colors.
+
 The default Discord Application ID is the public Plex RPC application used by
 [discord-rich-presence-plex](https://github.com/phin05/discord-rich-presence-plex/blob/master/server/config/default.go).
 You can override it with your own application ID (not a bot token).
@@ -53,5 +55,7 @@ pnpm exec eslint src/plugins/PlexRichPresence
 pnpm exec stylelint src/plugins/PlexRichPresence/style.css
 pnpm build
 ```
+
+The visual contrast/layout tests run when Chromium is installed at a standard system location or `PLEX_TEST_BROWSER` points to a Chromium executable; otherwise only these browser tests are skipped.
 
 Before relying on it, test a real shared account and Plex Home profile, switch from LAN to an external network, pause/seek/change tracks, and view the presence from **another Discord account**. Automated fixtures do not establish which permissions or Companion features your Plex installation exposes.

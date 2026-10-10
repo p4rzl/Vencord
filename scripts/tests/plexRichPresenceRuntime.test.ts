@@ -16,6 +16,7 @@ import type { Playback } from "../../src/plugins/PlexRichPresence/types";
 // Bundle the real plugin orchestrator; replace only its host (Discord/Vencord) interfaces.
 const bundle = build({
     entryPoints: ["src/plugins/PlexRichPresence/index.tsx"], bundle: true, write: false, platform: "node", format: "cjs",
+    jsxFactory: "React.createElement", jsxFragment: "React.Fragment",
     define: { IS_WEB: "false" },
     plugins: [{
         name: "fake-discord-host",
@@ -32,7 +33,11 @@ const bundle = build({
                     "@components/ErrorBoundary": "export default () => null;",
                     "@webpack/common": `export const FluxDispatcher = {dispatch: event => globalThis.host.activities.push(event.activity)};
                         export const ApplicationAssetUtils = {fetchAssetIds: async (id, urls) => {globalThis.host.assetUrls.push(...urls); return ["registered-public-asset"]}};
-                        export const Button = {}; export const Forms = {}; export const showToast = text => globalThis.host.toasts.push(text);`,
+                        export const React = globalThis.host.react;
+                        export const Button = {Colors: {RED: "red"}}; export const Forms = {}; export const Modal = {}; export const Select = {}; export const TextInput = {};
+                        export const openModal = (render, options) => {const key = "fixture-modal-" + globalThis.host.modals.length; globalThis.host.modals.push({render, options, key}); return key};
+                        export const closeModal = key => globalThis.host.modals.find(m => m.key === key)?.options?.onCloseCallback?.();
+                        export const showToast = text => globalThis.host.toasts.push(text);`,
                     "./widget": "export const PlayerWidget = () => null; export const updateWidget = value => globalThis.host.widgets.push(value);"
                 };
                 return { contents: sources[args.path], loader: "js" };
@@ -53,9 +58,28 @@ const playing: Playback = {
 };
 
 async function host(overrides: Record<string, unknown> = {}, initialSettings: Record<string, unknown> = {}) {
+    const hooks: any[] = [];
+    let hookIndex = 0;
+    let renderedModal = -1;
     const captured = {
         initialSettings: { plexToken: "fixture-account-token", showAlbumArt: false, ...initialSettings },
-        activities: [] as any[], widgets: [] as any[], toasts: [] as string[], assetUrls: [] as string[]
+        activities: [] as any[], widgets: [] as any[], toasts: [] as string[], assetUrls: [] as string[],
+        modals: [] as any[], prompts: [] as string[],
+        react: {
+            createElement: (type: unknown, props: any, ...children: unknown[]) => ({ type, props: { ...props, children } }),
+            useState: (initial: unknown) => {
+                const index = hookIndex++;
+                if (!(index in hooks)) hooks[index] = initial;
+                return [hooks[index], (value: unknown) => { hooks[index] = value; }];
+            }
+        },
+        renderModal: (index = captured.modals.length - 1): any => {
+            if (index !== renderedModal) { hooks.length = 0; renderedModal = index; }
+            hookIndex = 0;
+            const modal = captured.modals[index];
+            const element = modal.render({ transitionState: 1, onClose: () => modal.options?.onCloseCallback?.() });
+            return typeof element.type === "function" ? element.type(element.props) : element;
+        }
     };
     const native = {
         resetContext: async () => {},
@@ -67,10 +91,10 @@ async function host(overrides: Record<string, unknown> = {}, initialSettings: Re
     const module = { exports: {} as any };
     const output = (await bundle).outputFiles[0].text;
     runInNewContext(output, {
-        module, exports: module.exports, host: captured,
+        module, exports: module.exports, host: captured, React: captured.react,
         VencordNative: { pluginHelpers: { PlexRichPresence: native } },
         setTimeout: () => 1, clearTimeout: () => {}, URL, URLSearchParams, TextDecoder,
-        window: { prompt: () => null, alert: () => {} }
+        window: { prompt: (text: string) => { captured.prompts.push(text); throw new Error("prompt() is and will not be supported."); }, alert: () => {} }
     });
     const plugin = module.exports.default;
     return { plugin, captured };
@@ -152,4 +176,118 @@ test("runtime only discards an account login after an explicit authentication re
     await settle();
     assert.equal(expired.plugin.settings.store.plexToken, "");
     expired.plugin.stop();
+});
+
+for (const key of ["homeUserButton", "resourceButton", "playerButton"]) {
+    test(`settings ${key} opens a Discord selector when Electron rejects prompt()`, async () => {
+        const { plugin, captured } = await host({ fetchHomeUsers: async () => ({ ok: true, value: [{ id: "child", title: "Child", protected: false, restricted: true }] }) });
+        plugin.start();
+        await settle();
+        plugin.settings.definitions[key].component().props.onClick();
+        await settle();
+        assert.equal(captured.modals.length, 1, "click must open a usable selector");
+        assert.equal(captured.prompts.length, 0, "selectors must not depend on Electron prompt()");
+        plugin.stop();
+    });
+}
+
+function selectModal(captured: Awaited<ReturnType<typeof host>>["captured"], value: string) {
+    const modal = captured.renderModal();
+    modal.props.children[0].props.select(value);
+    const updated = captured.renderModal();
+    assert.equal(updated.props.actions[1].disabled, false);
+    updated.props.actions[1].onClick();
+}
+
+test("Home selector unlocks the selected profile and uses its token/identity for playback", async () => {
+    const contexts: Array<{ id: string; title: string; token: string; }> = [];
+    const { plugin, captured } = await host({
+        fetchHomeUsers: async () => ({ ok: true, value: [{ id: "child", title: "Child", protected: true, restricted: true }] }),
+        switchHomeUser: async (token: string, id: string, pin: string) => {
+            assert.equal(token, "fixture-account-token");
+            assert.equal(id, "child");
+            assert.equal(pin, "1234");
+            return { ok: true, value: { token: "fixture-child-token" } };
+        },
+        fetchCurrentUser: async (token: string) => ({ ok: true, value: token === "fixture-child-token" ? { ...user, id: "child", title: "Child", username: null } : user }),
+        fetchPlayback: async (_server: unknown, identity: any, token: string) => {
+            contexts.push({ id: identity.id, title: identity.title, token });
+            return { playback: playing, error: null, status: 200 };
+        }
+    });
+    plugin.start();
+    await settle();
+    plugin.settings.definitions.homeUserButton.component().props.onClick();
+    await settle();
+    selectModal(captured, "child");
+    await settle();
+    assert.equal(captured.modals.length, 2, "protected profile must request its PIN in a second Discord modal");
+    const pinModal = captured.renderModal();
+    assert.equal(pinModal.props.children[0].props.type, "password");
+    assert.equal(pinModal.props.actions[1].disabled, true);
+    pinModal.props.children[0].props.onChange("1234");
+    captured.renderModal().props.actions[1].onClick();
+    await settle();
+    assert.equal(plugin.settings.store.homeUserId, "child");
+    assert.deepEqual(contexts.at(-1), { id: "child", title: "Child", token: "fixture-child-token" });
+    assert.equal(JSON.stringify(plugin.settings.store).includes("1234"), false, "PIN must not be stored");
+    assert.equal(captured.prompts.length, 0);
+    plugin.stop();
+});
+
+test("canceling a selector retains settings and releases the setup lock", async () => {
+    const { plugin, captured } = await host();
+    plugin.start();
+    await settle();
+    plugin.settings.definitions.resourceButton.component().props.onClick();
+    await settle();
+    const before = plugin.settings.store.selectedResourceId;
+    captured.renderModal().props.actions[0].onClick();
+    await settle();
+    assert.equal(plugin.settings.store.selectedResourceId, before);
+    plugin.settings.definitions.playerButton.component().props.onClick();
+    await settle();
+    assert.equal(captured.modals.length, 2);
+    selectModal(captured, "");
+    await settle();
+    assert.equal(plugin.settings.store.preferredPlayerId, "");
+    plugin.stop();
+});
+
+test("server and player selectors apply identifiers rather than list positions", async () => {
+    const secondServer = { ...server, clientIdentifier: "other-server", name: "Other server" };
+    const player = { ...server, clientIdentifier: "my-player", provides: ["player"], owned: true, name: "Plexamp" };
+    const { plugin, captured } = await host({ discoverResources: async () => ({ ok: true, value: [server, secondServer, player] }) });
+    plugin.start();
+    await settle();
+    plugin.settings.definitions.resourceButton.component().props.onClick();
+    await settle();
+    selectModal(captured, "other-server");
+    await settle();
+    assert.equal(plugin.settings.store.selectedResourceId, "other-server");
+    assert.equal(plugin.settings.store.selectedResourceName, "Other server");
+    plugin.settings.definitions.playerButton.component().props.onClick();
+    await settle();
+    selectModal(captured, "my-player");
+    await settle();
+    assert.equal(plugin.settings.store.preferredPlayerId, "my-player");
+    plugin.stop();
+});
+
+test("logout during profile selection cancels the modal without switching identities", async () => {
+    let switches = 0;
+    const { plugin, captured } = await host({
+        fetchHomeUsers: async () => ({ ok: true, value: [{ id: "child", title: "Child", protected: false }] }),
+        switchHomeUser: async () => { switches++; return { ok: true, value: { token: "fixture-child-token" } }; }
+    });
+    plugin.start();
+    await settle();
+    plugin.settings.definitions.homeUserButton.component().props.onClick();
+    await settle();
+    plugin.settings.definitions.logoutButton.component().props.onClick();
+    await settle();
+    assert.equal(plugin.settings.store.plexToken, "");
+    assert.equal(switches, 0);
+    assert.equal(captured.activities.at(-1), null);
+    plugin.stop();
 });
