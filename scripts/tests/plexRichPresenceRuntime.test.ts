@@ -291,3 +291,57 @@ test("logout during profile selection cancels the modal without switching identi
     assert.equal(captured.activities.at(-1), null);
     plugin.stop();
 });
+
+test("startup does not request a Home PIN for the profile already authenticated by the account token", async () => {
+    const identities: string[] = [];
+    let homeSwitches = 0;
+    let homeReads = 0;
+    const { plugin, captured } = await host({
+        fetchHomeUsers: async () => { homeReads++; return { ok: true, value: [{ id: user.id, title: user.title, protected: true, restricted: false }] }; },
+        switchHomeUser: async () => { homeSwitches++; return { ok: false, kind: "unauthorized", status: 401 }; },
+        fetchPlayback: async (_server: unknown, identity: any) => {
+            identities.push(identity.id);
+            return { playback: playing, error: null, status: 200 };
+        }
+    }, { homeUserId: user.id, homeUserTitle: user.title });
+    for (let i = 0; i < 2; i++) {
+        plugin.start();
+        await settle();
+        assert.equal(captured.toasts.some(t => /PIN to reconnect/.test(t)), false, "an authenticated identity must not trigger the startup PIN warning");
+        assert.equal(captured.activities.at(-1)?.details, "Song");
+        plugin.stop();
+    }
+    assert.deepEqual(identities, [user.id, user.id]);
+    assert.equal(homeSwitches, 0);
+    assert.equal(homeReads, 0, "verified current identity does not require another Home lookup");
+    assert.equal(plugin.settings.store.homeUserId, user.id);
+});
+
+test("a different protected Home profile still requires authentication, even if its title matches the account", async () => {
+    let playbackReads = 0;
+    const { plugin, captured } = await host({
+        fetchHomeUsers: async () => ({ ok: true, value: [{ id: "different-profile", title: user.title, protected: true, restricted: true }] }),
+        fetchPlayback: async () => { playbackReads++; return { playback: playing, error: null, status: 200 }; }
+    }, { homeUserId: "different-profile", homeUserTitle: user.title });
+    plugin.start();
+    await settle();
+    assert.equal(playbackReads, 0, "the main account cannot impersonate another protected profile");
+    assert.ok(captured.toasts.some(t => /PIN to reconnect/.test(t)));
+    assert.equal(plugin.settings.store.homeUserId, "different-profile");
+    plugin.stop();
+});
+
+test("a Home lookup completed after shutdown cannot show a startup PIN warning", async () => {
+    let finish!: (value: unknown) => void;
+    const { plugin, captured } = await host({
+        fetchHomeUsers: () => new Promise(resolve => { finish = resolve; })
+    }, { homeUserId: "child", homeUserTitle: "Child" });
+    plugin.start();
+    await settle();
+    assert.ok(finish);
+    plugin.stop();
+    finish({ ok: true, value: [{ id: "child", title: "Child", protected: true, restricted: true }] });
+    await settle();
+    assert.equal(captured.toasts.some(t => /PIN to reconnect/.test(t)), false);
+    assert.equal(captured.activities.at(-1), null);
+});

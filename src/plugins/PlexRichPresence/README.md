@@ -6,7 +6,7 @@ Requires desktop Vencord and permission to read the shared/owned music library.
 ## Setup
 
 1. Enable the plugin and **Log in with Plex**. Approve the official browser flow; no Plex password is requested.
-2. If needed, **Choose Plex Home Profile**. Protected profiles require their PIN again after restarting; PINs are not saved.
+2. If needed, **Choose Plex Home Profile**. Switching to a different protected profile requires its PIN again after restarting; PINs are not saved. If Plex verifies that the login token already belongs to the saved profile, it is reused without a redundant startup PIN warning.
 3. **Choose Plex Server Resource** to select an owned or shared server.
 4. Optionally **Choose Plex Player** to follow a specific device. Automatic mode prefers a playing session belonging to your selected identity.
 5. Enable activity sharing in Discord's Activity Privacy settings. Restart Discord after installing this version so the account-panel patch can load.

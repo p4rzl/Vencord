@@ -105,7 +105,9 @@ async function ensureContext(generation: number) {
         const homeId = settings.store.homeUserId;
         // Earlier versions stored the main account name as a Home selection even without switching.
         if (!homeId && [user.title, user.username].includes(settings.store.homeUserTitle)) settings.store.homeUserTitle = "";
-        if (homeId || settings.store.homeUserTitle) {
+        // A PIN protects switching identities, not reuse of a token Plex already authenticated for this exact ID.
+        const profileAlreadyAuthenticated = Boolean(homeId && homeId === user.id);
+        if ((homeId || settings.store.homeUserTitle) && !profileAlreadyAuthenticated) {
             const home = await Native.fetchHomeUsers(accountToken);
             if (!lifetime.current(generation)) return false;
             if (!home.ok) { failure(home.kind, "home", home.status); return false; }
